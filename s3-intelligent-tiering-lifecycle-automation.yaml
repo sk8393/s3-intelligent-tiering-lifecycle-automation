@@ -1,0 +1,375 @@
+AWSTemplateFormatVersion : '2010-09-09'
+
+Parameters:
+  ConfigRuleNameToDetectNonOptimizedS3Bucket:
+    Type: String
+    Default: 'rule-to-detect-non-optimized-s3-bucket'
+  LifecycleRuleNameToTransitionToIntelligentTiering:
+    Type: String
+    Default: 'lifecycle-rule-to-transition-to-intelligent-tiering'
+  LifecycleRuleNameToDeleteMultipartUpload:
+    Type: String
+    Default: 'lifecycle-rule-to-delete-multipart-upload'
+  TagKeyToApplyLifecycle:
+    Type: String
+    Default: 'apply-lifecycle-for-intelligent-tiering'
+  TagValueToApplyLifecycle:
+    Type: String
+    Default: 'true'
+
+Resources:
+  ResourceOfConfigRuleToDetectNonOptimizedS3Bucket:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ResourceOfLambdaPermission
+    Properties:
+      ConfigRuleName: !Ref ConfigRuleNameToDetectNonOptimizedS3Bucket
+      EvaluationModes:
+        - Mode: 'DETECTIVE'
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceDetails:
+        - EventSource: aws.config
+          MaximumExecutionFrequency: TwentyFour_Hours
+          MessageType: ScheduledNotification
+        SourceIdentifier: !GetAtt ResourceOfLambdaFunctionToDetectNonOptimizedS3Bucket.Arn
+
+  ResourceOfLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ResourceOfLambdaFunctionToDetectNonOptimizedS3Bucket.Arn
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+
+  ResourceOfIAMManagedPolicyToDeleteEvaluationResults:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "config:DeleteEvaluationResults"
+            Resource: "*"
+
+  ResourceOfIAMRoleToDetectNonOptimizedS3Bucket:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AWSLambda_FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRulesExecutionRole
+        - !Ref ResourceOfIAMManagedPolicyToDeleteEvaluationResults
+
+  ResourceOfIAMRoleToApplyS3LifecyleRule:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AWSConfigUserAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  ResourceOfLambdaFunctionToDetectNonOptimizedS3Bucket:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import botocore
+          import json
+          import os
+          
+          CONFIG_RULE_NAME = os.environ['CONFIG_RULE_NAME']
+          SUBSEQUENT_FUNCTION = os.environ['SUBSEQUENT_FUNCTION']
+          
+          def get_s3_bucket_name_list():
+              client = boto3.client('s3')
+              response = client.list_buckets()
+              # print("response = {}".format(response))
+              bucket_list = response.get('Buckets', [])
+              bucket_name_list = list()
+              for _i in bucket_list:
+                  bucket_name_list.append(_i['Name'])
+              # print("bucket_name_list = {}".format(bucket_name_list))
+              return bucket_name_list
+          
+          def get_bucket_region(_arg_bucket_name):
+              client = boto3.client('s3')
+              response = client.head_bucket(Bucket=_arg_bucket_name)
+              # print("response = {}".format(response))
+              bucket_region = response['ResponseMetadata']['HTTPHeaders']['x-amz-bucket-region']
+              return bucket_region
+          
+          def check_is_all_object_standard(_arg_bucket_name):
+              is_all_object_standard = False
+          
+              bucket_region = get_bucket_region(_arg_bucket_name)
+          
+              client = boto3.setup_default_session(region_name=bucket_region)
+              client = boto3.client('cloudwatch')
+          
+              response = client.list_metrics(
+                  Dimensions=[{'Name':'BucketName','Value':_arg_bucket_name}],
+                  MetricName = 'BucketSizeBytes',
+                  Namespace = 'AWS/S3'
+              )
+          
+              metric_list = response.get('Metrics', [])
+              # e.g. [{'Namespace': 'AWS/S3', 'MetricName': 'BucketSizeBytes', 'Dimensions': [{'Name': 'StorageType', 'Value': 'StandardStorage'}, {'Name': 'BucketName', 'Value': 'example-bucket'}]}]
+              # print("metric_list = {}".format(metric_list))
+              len_metric_list = len(metric_list)
+              # If the bucket is empty, that can be a new one.  That means applying Lifecycle rule should be OK.
+              if len_metric_list == 0:
+                  is_all_object_standard = True
+              elif len_metric_list == 1:
+                  value_list = list()
+                  for _i in metric_list[0]['Dimensions']:
+                      value_list.append(_i['Value'])
+                  # print("value_list = {}".format(value_list))
+                  if 'StandardStorage' in value_list:
+                      is_all_object_standard = True
+                  else:
+                      pass
+              else:
+                  pass
+          
+              return is_all_object_standard
+          
+          def check_is_lifecycle_rule_set(_arg_bucket_name):
+              is_lifecycle_rule_set = True
+              client = boto3.client('s3')
+              try:
+                  response = client.get_bucket_lifecycle(Bucket=_arg_bucket_name)
+                  rule_list = response.get('Rules', [])
+                  # print("rule_list = {}".format(rule_list))
+              except botocore.exceptions.ClientError as e:
+                  is_lifecycle_rule_set = False
+              return is_lifecycle_rule_set
+          
+          def delete_config_evaluation_result(_arg_config_rule_name):
+              client = boto3.setup_default_session(region_name=os.environ['AWS_DEFAULT_REGION'])
+              client = boto3.client('config')
+              response = client.delete_evaluation_results(
+                  ConfigRuleName=_arg_config_rule_name
+              )
+          
+          def put_config_evaluation(_arg_bucket_name_list, _arg_bucket_with_all_standard_object_and_no_lifecycle_rule_name_list, _arg_result_token):
+              client = boto3.client("config")
+              evaluation_list = list()
+              for _i in _arg_bucket_name_list:
+                  compliance_type = 'COMPLIANT'
+                  if _i in _arg_bucket_with_all_standard_object_and_no_lifecycle_rule_name_list:
+                      compliance_type = 'NON_COMPLIANT'
+                  else:
+                      pass
+                  evaluation = {
+                      'ComplianceResourceType': 'AWS::S3::Bucket',
+                      'ComplianceResourceId': _i,
+                      'ComplianceType': compliance_type,
+                      'OrderingTimestamp': '1970-01-01T00:00:00.0Z'
+                  }
+                  evaluation_list.append(evaluation)
+              print("evaluation_list = {}".format(evaluation_list))
+              client.put_evaluations(
+                  Evaluations = evaluation_list,
+                  ResultToken = _arg_result_token
+              )
+          
+          def invoke_function():
+              p = {
+                  'dummy_key': 'dummy_value'
+              }
+              payload = json.dumps(p)
+              client = boto3.client('lambda', region_name=os.environ['AWS_DEFAULT_REGION'])
+              client.invoke(
+                  FunctionName = SUBSEQUENT_FUNCTION,
+                  InvocationType = 'Event',
+                  Payload = payload
+              )
+          
+          def lambda_handler(event, context):
+              print("event = {}".format(event))
+              invoking_event = json.loads(event["invokingEvent"])
+              print("invoking_event = {}".format(invoking_event))
+          
+              result_token = "No token found."
+              if "resultToken" in event:
+                  result_token = event["resultToken"]
+          
+              bucket_name_list = get_s3_bucket_name_list()
+          
+              # bucket_name_list = ['example-bucket-01']
+              bucket_with_all_standard_object_name_list = list()
+              for _i_bucket_name in bucket_name_list:
+                  print("_i_bucket_name = {}".format(_i_bucket_name))
+                  is_all_object_standard = check_is_all_object_standard(_i_bucket_name)
+                  print("is_all_object_standard = {}".format(is_all_object_standard))
+                  if is_all_object_standard:
+                      bucket_with_all_standard_object_name_list.append(_i_bucket_name)
+                  else:
+                      pass
+          
+              print("bucket_with_all_standard_object_name_list = {}".format(bucket_with_all_standard_object_name_list))
+          
+              bucket_with_all_standard_object_and_no_lifecycle_rule_name_list = list()
+              for _i_bucket_name in bucket_with_all_standard_object_name_list:
+                  print("_i_bucket_name = {}".format(_i_bucket_name))
+                  is_lifecycle_rule_set = check_is_lifecycle_rule_set(_i_bucket_name)
+                  print("is_lifecycle_rule_set = {}".format(is_lifecycle_rule_set))
+                  if is_lifecycle_rule_set:
+                      pass
+                  else:
+                      bucket_with_all_standard_object_and_no_lifecycle_rule_name_list.append(_i_bucket_name)
+          
+              print("bucket_with_all_standard_object_and_no_lifecycle_rule_name_list = {}".format(bucket_with_all_standard_object_and_no_lifecycle_rule_name_list))
+          
+              try:
+                  # Deleted S3 bucket won't be removed from evaluation result, so need refresh resource list.
+                  delete_config_evaluation_result(CONFIG_RULE_NAME)
+                  put_config_evaluation(bucket_name_list, bucket_with_all_standard_object_and_no_lifecycle_rule_name_list, result_token)
+              except Exception as e:
+                  print("e = {}".format(e))
+          
+              invoke_function()
+      Environment:
+        Variables:
+          CONFIG_RULE_NAME: !Ref ConfigRuleNameToDetectNonOptimizedS3Bucket
+          SUBSEQUENT_FUNCTION: !Ref ResourceOfLambdaFunctionToApplyS3LifecyleRule
+      Handler: index.lambda_handler
+      Role: !GetAtt ResourceOfIAMRoleToDetectNonOptimizedS3Bucket.Arn
+      Runtime: python3.11
+      Timeout: 900
+
+  ResourceOfLambdaFunctionToApplyS3LifecyleRule:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import botocore
+          import os
+          
+          CONFIG_RULE_NAME = os.environ['CONFIG_RULE_NAME']
+          LIFECYCLE_RULE_NAME_FOR_INTELLIGENT_TIERING = os.environ['LIFECYCLE_RULE_NAME_FOR_INTELLIGENT_TIERING']
+          LIFECYCLE_RULE_NAME_FOR_MULTIPART_UPLOAD = os.environ['LIFECYCLE_RULE_NAME_FOR_MULTIPART_UPLOAD']
+          TAG_KEY_TO_APPLY_LIFECYCLE = os.environ['TAG_KEY_TO_APPLY_LIFECYCLE']
+          TAG_VALUE_TO_APPLY_LIFECYCLE = os.environ['TAG_VALUE_TO_APPLY_LIFECYCLE']
+          
+          def check_is_tag_set_to_apply_lifecyle(_arg_bucket_name):
+              is_tag_set_to_apply_lifecyle = False
+              client = boto3.client('s3')
+              try:
+                  response = client.get_bucket_tagging(Bucket=_arg_bucket_name)
+                  print("response = {}".format(response))
+                  tag_set_list = response.get('TagSet', [])
+                  for _i in tag_set_list:
+                      key = _i['Key']
+                      value = _i['Value']
+                      if key == TAG_KEY_TO_APPLY_LIFECYCLE and value == TAG_VALUE_TO_APPLY_LIFECYCLE:
+                          is_tag_set_to_apply_lifecyle = True
+                      else:
+                          pass
+              except botocore.exceptions.ClientError as e:
+                  pass
+              return is_tag_set_to_apply_lifecyle
+          
+          def get_non_compliant_s3_bucket_list():
+              evaluation_result_list = list()
+              client = boto3.client('config')
+              paginator = client.get_paginator('get_compliance_details_by_config_rule')
+              page_list = paginator.paginate(
+                  ComplianceTypes=['NON_COMPLIANT'],
+                  ConfigRuleName='rule-to-detect-non-optimized-s3-bucket'
+              )
+              count = 0
+              for _i_page in page_list:
+                  count += 1
+                  evaluation_result_list += _i_page.get('EvaluationResults', [])
+              resource_id_list = list()
+              for _i_evaluation_result in evaluation_result_list:
+                  resource_id = _i_evaluation_result['EvaluationResultIdentifier']['EvaluationResultQualifier']['ResourceId']
+                  print("resource_id = {}".format(resource_id))
+                  resource_id_list.append(resource_id)
+              return resource_id_list
+          
+          def put_s3_bucket_lifecycle_rule(_arg_bucket_name):
+              client = boto3.client('s3')
+          
+              lifecycle_rule_for_intelligent_tiering = {
+                  'Filter': {
+                      'ObjectSizeGreaterThan': 131072
+                  },
+                  'ID': LIFECYCLE_RULE_NAME_FOR_INTELLIGENT_TIERING,
+                  'NoncurrentVersionTransitions': [
+                      {
+                          'NoncurrentDays': 0,
+                          'StorageClass': 'INTELLIGENT_TIERING'
+                      }
+                  ],
+                  'Status': 'Enabled',
+                  'Transitions': [
+                      {
+                          'Days': 0,
+                          'StorageClass': 'INTELLIGENT_TIERING'
+                      }
+                  ]
+              }
+          
+              lifecycle_rule_for_multipart_upload = {
+                  'Filter': {
+                      'Prefix': ''
+                  },
+                  'AbortIncompleteMultipartUpload': {
+                      'DaysAfterInitiation': 7
+                  },
+                  'ID': LIFECYCLE_RULE_NAME_FOR_MULTIPART_UPLOAD,
+                  'Status': 'Enabled'
+              }
+          
+              lifecycle_configuration = {
+                  'Rules': [lifecycle_rule_for_intelligent_tiering, lifecycle_rule_for_multipart_upload]
+              }
+          
+              client.put_bucket_lifecycle_configuration(
+                  Bucket=_arg_bucket_name,
+                  LifecycleConfiguration=lifecycle_configuration
+              )
+          
+          def lambda_handler(event, context):
+              print("event = {}".format(event))
+              non_compliant_s3_bucket_list = get_non_compliant_s3_bucket_list()
+          
+              for _i in non_compliant_s3_bucket_list:
+                  is_tag_set_to_apply_lifecyle = check_is_tag_set_to_apply_lifecyle(_i)
+                  print("is_tag_set_to_apply_lifecyle = {}".format(is_tag_set_to_apply_lifecyle))
+                  if is_tag_set_to_apply_lifecyle:
+                      put_s3_bucket_lifecycle_rule(_i)
+      Environment:
+        Variables:
+          CONFIG_RULE_NAME: !Ref ConfigRuleNameToDetectNonOptimizedS3Bucket
+          LIFECYCLE_RULE_NAME_FOR_INTELLIGENT_TIERING: !Ref LifecycleRuleNameToTransitionToIntelligentTiering
+          LIFECYCLE_RULE_NAME_FOR_MULTIPART_UPLOAD: !Ref LifecycleRuleNameToDeleteMultipartUpload
+          TAG_KEY_TO_APPLY_LIFECYCLE: !Ref TagKeyToApplyLifecycle
+          TAG_VALUE_TO_APPLY_LIFECYCLE: !Ref TagValueToApplyLifecycle
+      Handler: index.lambda_handler
+      Role: !GetAtt ResourceOfIAMRoleToApplyS3LifecyleRule.Arn
+      Runtime: python3.11
+      Timeout: 900
+
