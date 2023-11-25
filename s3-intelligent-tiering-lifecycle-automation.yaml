@@ -296,7 +296,7 @@ Resources:
               paginator = client.get_paginator('get_compliance_details_by_config_rule')
               page_list = paginator.paginate(
                   ComplianceTypes=['NON_COMPLIANT'],
-                  ConfigRuleName='rule-to-detect-non-optimized-s3-bucket'
+                  ConfigRuleName=CONFIG_RULE_NAME
               )
               count = 0
               for _i_page in page_list:
