@@ -9,7 +9,9 @@ If you are considering migration of objects stored in **Standard** storage class
  Transitioning objects from **Standard** to **Intelligent-Tiering** through Lifecycle will be charged $0.01 per 1,000 requests.  Filter can be set to Lifecycle rule as objects bigger than 128 Kilobytes are only transitioned.
 
 ## Installation
-This sample can be deployed via CloudFormation template.  Applying Lifecycle rule only happens for S3 bucket which has specific tag.  Default is `'apply-lifecycle-for-intelligent-tiering':'true'`.  You can change these tag key/value as CloudFormation parameter.
+This sample can be deployed via CloudFormation template.  Applying Lifecycle rule only happens for S3 bucket which has specific tag.  Default is `'apply-lifecycle-for-intelligent-tiering':'true'`.  You can change these tag key/value as CloudFormation parameter.  Following parameters can be set through CloudFormation.
+
+![CloudFormation_parameter](https://github.com/sk8393/s3-intelligent-tiering-lifecycle-automation/assets/13175031/5b30c870-4ecf-4478-949f-d46197d5697e)
 
 ## Usage
 System architecture looks like below.  Lifecycle rule will be applied only when S3 bucket has specific tag.  [AWS Config](https://aws.amazon.com/config/) is a regional service, but this solution can cover all S3 buckets across different regions.  Please enable Config on the region where you deploy CloudFormation stack beforehand.
