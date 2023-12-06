@@ -4,18 +4,23 @@ Parameters:
   ConfigRuleNameToDetectNonOptimizedS3Bucket:
     Type: String
     Default: 'rule-to-detect-non-optimized-s3-bucket'
+    Description: 'Name of AWS Config Custom Lambda Rule to detect S3 bucket whose objects are all Standard storage class and Lifecycle rule is not set.'
   LifecycleRuleNameToTransitionToIntelligentTiering:
     Type: String
     Default: 'lifecycle-rule-to-transition-to-intelligent-tiering'
+    Description: 'S3 Lifecycle rule to transition Standard storage class objects to Intelligent-Tiering.'
   LifecycleRuleNameToDeleteMultipartUpload:
     Type: String
     Default: 'lifecycle-rule-to-delete-multipart-upload'
+    Description: 'S3 Lifecycle rule to delete incomplete multipart uploads.'
   TagKeyToApplyLifecycle:
     Type: String
     Default: 'apply-lifecycle-for-intelligent-tiering'
+    Description: 'Tag key that you set to S3 bucket to apply Lifecycle rule.'
   TagValueToApplyLifecycle:
     Type: String
     Default: 'true'
+    Description: 'Tag value that you set to S3 bucket to apply Lifecycle rule.'
 
 Resources:
   ResourceOfConfigRuleToDetectNonOptimizedS3Bucket:
@@ -98,6 +103,8 @@ Resources:
           
           CONFIG_RULE_NAME = os.environ['CONFIG_RULE_NAME']
           SUBSEQUENT_FUNCTION = os.environ['SUBSEQUENT_FUNCTION']
+          TAG_KEY_TO_APPLY_LIFECYCLE = os.environ['TAG_KEY_TO_APPLY_LIFECYCLE']
+          TAG_VALUE_TO_APPLY_LIFECYCLE = os.environ['TAG_VALUE_TO_APPLY_LIFECYCLE']
           
           def get_s3_bucket_name_list():
               client = boto3.client('s3')
@@ -174,17 +181,20 @@ Resources:
               client = boto3.client("config")
               evaluation_list = list()
               for _i in _arg_bucket_name_list:
-                  compliance_type = 'COMPLIANT'
-                  if _i in _arg_bucket_with_all_standard_object_and_no_lifecycle_rule_name_list:
-                      compliance_type = 'NON_COMPLIANT'
-                  else:
-                      pass
                   evaluation = {
                       'ComplianceResourceType': 'AWS::S3::Bucket',
                       'ComplianceResourceId': _i,
-                      'ComplianceType': compliance_type,
                       'OrderingTimestamp': '1970-01-01T00:00:00.0Z'
                   }
+                  if _i in _arg_bucket_with_all_standard_object_and_no_lifecycle_rule_name_list:
+                      evaluation['ComplianceType'] = 'NON_COMPLIANT'
+                      annotation = "Objects are all Standard storage class and Lifecycle rule is not set.  Set tag \'{}\':\'{}\' to apply Lifecycle rule.".format(
+                          TAG_KEY_TO_APPLY_LIFECYCLE,
+                          TAG_VALUE_TO_APPLY_LIFECYCLE
+                      )
+                      evaluation['Annotation'] = annotation
+                  else:
+                      evaluation['ComplianceType'] = 'COMPLIANT'
                   evaluation_list.append(evaluation)
               print("evaluation_list = {}".format(evaluation_list))
               client.put_evaluations(
@@ -252,6 +262,8 @@ Resources:
         Variables:
           CONFIG_RULE_NAME: !Ref ConfigRuleNameToDetectNonOptimizedS3Bucket
           SUBSEQUENT_FUNCTION: !Ref ResourceOfLambdaFunctionToApplyS3LifecyleRule
+          TAG_KEY_TO_APPLY_LIFECYCLE: !Ref TagKeyToApplyLifecycle
+          TAG_VALUE_TO_APPLY_LIFECYCLE: !Ref TagValueToApplyLifecycle
       Handler: index.lambda_handler
       Role: !GetAtt ResourceOfIAMRoleToDetectNonOptimizedS3Bucket.Arn
       Runtime: python3.11
